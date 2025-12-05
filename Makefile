@@ -1,6 +1,7 @@
 MODULE = equality
 ARCH = amd64
-PLATFORMS = linux windows darwin openbsd
+PLATFORMS = linux windows openbsd
+# https://gist.github.com/asukakenji/f15ba7e588ac42795f421b48b8aede63
 
 BIN_DIR = ./bin
 SRC_DIR = ./src

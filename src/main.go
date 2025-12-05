@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
@@ -15,409 +19,498 @@ import (
 	"time"
 )
 
-// Server manages the main proxy server
-type Server struct {
-	config      *Config
-	ctx         context.Context
-	cancel      context.CancelFunc
-	activeConns sync.WaitGroup
-	verbose     bool
+const (
+	TypeAuth = 0
+	TypeData = 1
+	TypePad  = 2
+	TypeClose = 3
+	MinFrame = 100
+	MaxFrame = 65535
+	MaxPend = 1048576
+	Timeout = 30 * time.Second
+)
+
+type Config struct {
+	XMLName xml.Name `xml:"config"`
+	Ver     int      `xml:"ver,attr"`
+	In      struct {
+		Type  string `xml:"type,attr"`
+		Port  int    `xml:"port,attr"`
+		Clock int    `xml:"clock,attr,omitempty"`
+		Frame int    `xml:"frame,attr,omitempty"`
+		SSL   *struct {
+			Key string `xml:"key,attr"`
+			Crt string `xml:"crt,attr"`
+		} `xml:"ssl,omitempty"`
+		Reverse *struct {
+			Host string `xml:"host,attr"`
+			Port int    `xml:"port,attr"`
+		} `xml:"reverse,omitempty"`
+		SID struct {
+			Items []string `xml:"item"`
+		} `xml:"sid,omitempty"`
+	} `xml:"in"`
+	Out struct {
+		Type   string `xml:"type,attr"`
+		Server string `xml:"server,attr,omitempty"`
+		Port   int    `xml:"port,attr,omitempty"`
+		SID    string `xml:"sid,attr,omitempty"`
+		Clock  int    `xml:"clock,attr,omitempty"`
+		Frame  int    `xml:"frame,attr,omitempty"`
+	} `xml:"out"`
+	Verbose bool `xml:"verbose,attr,omitempty"`
 }
 
-// NewServer creates a new server instance
-func NewServer(cfg *Config) *Server {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{
-		config:  cfg,
-		ctx:     ctx,
-		cancel:  cancel,
-		verbose: cfg. Verbose,
-	}
+type Frame struct {
+	Type   uint8
+	Length uint16
+	Data   []byte
+}
+
+type Server struct {
+	cfg    *Config
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt. Fprintf(os.Stderr, "Usage: %s <config.xml>\n", os.Args[0])
-		os.Exit(1)
+		log.Fatal("usage: eq <config.xml>")
 	}
 
-	cfg, err := LoadConfig(os. Args[1])
+	f, err := os.Open(os.Args[1])
 	if err != nil {
-		log. Fatalf("Failed to load config: %v", err)
+		log.Fatal(err)
 	}
+	cfg := &Config{}
+	xml.NewDecoder(f).Decode(cfg)
+	f.Close()
 
-	if err := ValidateConfig(cfg); err != nil {
-		log.Fatalf("Invalid config: %v", err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Server{cfg: cfg, ctx: ctx, cancel: cancel}
 
-	server := NewServer(cfg)
-
-	// Setup signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall. SIGTERM)
-
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-sigChan
-		log.Println("\nReceived shutdown signal, gracefully closing connections...")
-		server. Shutdown()
+		<-sig
+		cancel()
+		s.wg.Wait()
+		os.Exit(0)
 	}()
 
-	// Start appropriate mode
 	if cfg.In.Type == "socks" {
-		if err := server.RunClient(); err != nil {
-			log. Fatalf("Client error: %v", err)
-		}
-	} else if cfg.In.Type == "eq" {
-		if err := server.RunServer(); err != nil {
-			log.Fatalf("Server error: %v", err)
-		}
+		s.runClient()
 	} else {
-		log.Fatalf("Unknown mode: %s (expected 'socks' or 'eq')", cfg.In.Type)
+		s.runServer()
 	}
 }
 
-// Shutdown gracefully shuts down the server
-func (s *Server) Shutdown() {
-	s.cancel()
-
-	shutdownTimeout := 10 * time.Second
-	if s.config.ShutdownTimeout > 0 {
-		shutdownTimeout = time.Duration(s.config.ShutdownTimeout) * time.Second
-	}
-
-	done := make(chan struct{})
-	go func() {
-		s.activeConns.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Println("All connections closed gracefully")
-	case <-time.After(shutdownTimeout):
-		log.Println("Timeout waiting for connections, forcing exit")
-	}
-	os.Exit(0)
-}
-
-// RunClient runs the SOCKS5 client mode
-func (s *Server) RunClient() error {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.config.In.Port))
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
-	}
+func (s *Server) runClient() {
+	ln, _ := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.In.Port))
 	defer ln.Close()
-
-	log.Printf("Client listening on :%d (SOCKS5)", s.config.In.Port)
-	log.Printf("Forwarding to %s:%d with frame=%d, clock=%dms",
-		s.config.Out. Server, s.config.Out.Port, s.config.Out.Frame, s.config.Out.Clock)
+	log.Printf("client :%d -> %s:%d", s.cfg.In.Port, s.cfg.Out.Server, s.cfg.Out.Port)
 
 	for {
-		select {
-		case <-s. ctx.Done():
-			return nil
-		default:
-		}
-
-		// Set accept timeout to allow shutdown checks
 		if tcpLn, ok := ln.(*net.TCPListener); ok {
 			tcpLn.SetDeadline(time.Now().Add(time.Second))
 		}
-
 		conn, err := ln.Accept()
 		if err != nil {
-			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
-				continue
-			}
 			select {
-			case <-s. ctx.Done():
-				return nil
+			case <-s.ctx.Done():
+				return
 			default:
-				log.Printf("Accept error: %v", err)
 				continue
 			}
 		}
-
-		s.activeConns.Add(1)
+		s.wg.Add(1)
 		go func() {
-			defer s.activeConns.Done()
-			if err := s.handleSOCKS(conn); err != nil {
-				if s.verbose {
-					log.Printf("SOCKS error: %v", err)
-				}
-			}
+			defer s.wg.Done()
+			s.handleSocks(conn)
 		}()
 	}
 }
 
-// handleSOCKS processes a SOCKS5 client connection
-func (s *Server) handleSOCKS(conn net.Conn) error {
-	defer conn.Close()
-
-	// Read SOCKS version identifier/method selection message
+func (s *Server) handleSocks(c net.Conn) {
+	defer c.Close()
 	buf := make([]byte, 512)
-	conn.SetReadDeadline(time.Now().Add(DefaultTimeout))
-	n, err := conn.Read(buf)
-	conn.SetReadDeadline(time.Time{})
+	
+	c.SetReadDeadline(time.Now().Add(Timeout))
+	n, err := c.Read(buf)
+	c.SetReadDeadline(time.Time{})
+	if err != nil || n < 2 || buf[0] != 5 {
+		return
+	}
+
+	c.Write([]byte{5, 0})
+
+	c.SetReadDeadline(time.Now().Add(Timeout))
+	n, err = c.Read(buf)
+	c.SetReadDeadline(time.Time{})
+	if err != nil {
+		return
+	}
+
+	host, port := parseSocks(buf[:n])
+	if host == "" {
+		c.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	eq := s.dialEQ(target)
+	if eq == nil {
+		c.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer eq.Close()
+
+	c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+	log.Printf("proxy %s -> %s", c.RemoteAddr(), target)
+
+	relay(s.ctx, eq, c, s.cfg.Out.Frame, time.Duration(s.cfg.Out.Clock)*time.Millisecond)
+}
+
+func parseSocks(buf []byte) (string, uint16) {
+	if len(buf) < 4 || buf[0] != 5 || buf[1] != 1 {
+		return "", 0
+	}
+	switch buf[3] {
+	case 1:
+		if len(buf) < 10 {
+			return "", 0
+		}
+		return fmt.Sprintf("%d.%d.%d.%d", buf[4], buf[5], buf[6], buf[7]),
+			binary.BigEndian.Uint16(buf[8:10])
+	case 3:
+		if len(buf) < 5 {
+			return "", 0
+		}
+		l := int(buf[4])
+		if len(buf) < 5+l+2 {
+			return "", 0
+		}
+		return string(buf[5 : 5+l]), binary.BigEndian.Uint16(buf[5+l : 5+l+2])
+	}
+	return "", 0
+}
+
+func (s *Server) dialEQ(target string) net.Conn {
+	addr := fmt.Sprintf("%s:%d", s.cfg.Out.Server, s.cfg.Out.Port)
+	ctx, cancel := context.WithTimeout(s.ctx, Timeout)
+	defer cancel()
+
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: s.cfg.Out.Server})
+	nonce := make([]byte, 16)
+	rand.Read(nonce)
+
+	ts := time.Now().Unix()
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%s", s.cfg.Out.SID, ts, hex.EncodeToString(nonce))))
+	auth := fmt.Sprintf("%s|%d|%s|%s", hex.EncodeToString(hash[:]), ts, hex.EncodeToString(nonce), target)
+
+	frame := &Frame{Type: TypeAuth, Length: uint16(len(auth)), Data: []byte(auth)}
+	frameBuf, _ := frame.marshal(s.cfg.Out.Frame)
+
+	tlsConn.SetWriteDeadline(time.Now().Add(Timeout))
+	_, err = tlsConn.Write(frameBuf)
+	tlsConn.SetWriteDeadline(time.Time{})
 
 	if err != nil {
-		return fmt.Errorf("read handshake: %w", err)
+		tlsConn.Close()
+		return nil
+	}
+	return tlsConn
+}
+
+func (s *Server) runServer() {
+	var ln net.Listener
+	addr := fmt.Sprintf(":%d", s.cfg.In.Port)
+
+	if s.cfg.In.SSL != nil {
+		cert, _ := tls.LoadX509KeyPair(s.cfg.In.SSL.Crt, s.cfg.In.SSL.Key)
+		ln, _ = tls.Listen("tcp", addr, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		})
+	} else {
+		ln, _ = net.Listen("tcp", addr)
+	}
+	defer ln.Close()
+	log.Printf("server %s", addr)
+
+	for {
+		if tcpLn, ok := ln.(*net.TCPListener); ok {
+			tcpLn.SetDeadline(time.Now().Add(time.Second))
+		}
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+				continue
+			}
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handleIncoming(conn)
+		}()
+	}
+}
+
+func (s *Server) handleIncoming(c net.Conn) {
+	defer c.Close()
+
+	peek := make([]byte, 3)
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err := io.ReadFull(c, peek)
+	c.SetReadDeadline(time.Time{})
+
+	if err != nil || n != 3 || peek[0] != TypeAuth {
+		s.reverseProxy(c, peek[:n])
+		return
 	}
 
-	if n < 2 || buf[0] != 5 {
-		return fmt. Errorf("invalid SOCKS version: %d", buf[0])
+	length := binary.BigEndian.Uint16(peek[1:3])
+	if length == 0 || int(length) > s.cfg.In.Frame-3 {
+		s.reverseProxy(c, peek)
+		return
 	}
 
-	if err := SOCKS5AuthResponse(conn); err != nil {
-		return fmt.Errorf("write auth response: %w", err)
+	rest := make([]byte, s.cfg.In.Frame-3)
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err = io.ReadFull(c, rest)
+	c.SetReadDeadline(time.Time{})
+
+	if err != nil || n != s.cfg.In.Frame-3 {
+		combined := append(peek, rest[:n]...)
+		s.reverseProxy(c, combined)
+		return
 	}
 
-	// Read SOCKS request
-	conn.SetReadDeadline(time.Now().Add(DefaultTimeout))
-	n, err = conn. Read(buf)
-	conn. SetReadDeadline(time. Time{})
-
-	if err != nil {
-		return fmt. Errorf("read request: %w", err)
+	buf := append(peek, rest...)
+	frame := &Frame{}
+	if frame.unmarshal(buf) != nil {
+		s.reverseProxy(c, buf)
+		return
 	}
 
-	host, port, err := ParseSOCKS5Request(buf[:n])
-	if err != nil {
-		SOCKS5ErrorResponse(conn, SOCKS5ErrorUnsupportedAddr)
-		return fmt.Errorf("parse request: %w", err)
+	parts := split(frame.Data, '|')
+	if len(parts) != 4 {
+		s.reverseProxy(c, buf)
+		return
 	}
 
-	target := FormatTarget(host, port)
-
-	// Connect to EQ server
-	eqConn, err := s.connectToServer(target)
-	if err != nil {
-		SOCKS5ErrorResponse(conn, SOCKS5ErrorConnectionFailed)
-		return fmt. Errorf("connect to server: %w", err)
-	}
-	defer eqConn.Close()
-
-	if err := SOCKS5SuccessResponse(conn); err != nil {
-		return fmt.Errorf("write success response: %w", err)
+	var ts int64
+	fmt.Sscanf(string(parts[1]), "%d", &ts)
+	if time.Now().Unix()-ts > 300 || time.Now().Unix()-ts < -300 {
+		s.reverseProxy(c, buf)
+		return
 	}
 
-	log.Printf("Proxying: %s -> %s", conn.RemoteAddr(), target)
-
-	cfg := RelayConfig{
-		Clock:     time.Duration(s.config.Out.Clock) * time.Millisecond,
-		FrameSize: s.config.Out.Frame,
-		Verbose:   s.verbose,
-	}
-
-	if err := ClientRelay(s.ctx, conn, eqConn, cfg); err != nil {
-		if s.verbose {
-			log. Printf("Relay error: %v", err)
+	valid := false
+	for _, sid := range s.cfg.In.SID.Items {
+		hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%s", sid, ts, string(parts[2]))))
+		if string(parts[0]) == hex.EncodeToString(hash[:]) {
+			valid = true
+			break
 		}
 	}
 
-	log.Printf("Closed: %s -> %s", conn.RemoteAddr(), target)
-	return nil
-}
-
-// connectToServer establishes a TLS connection to the EQ server
-func (s *Server) connectToServer(target string) (net.Conn, error) {
-	addr := fmt.Sprintf("%s:%d", s.config.Out.Server, s.config.Out.Port)
-
-	tlsConfig := &tls.Config{
-		ServerName:         s.config.Out.Server,
-		InsecureSkipVerify: false,
+	if !valid {
+		s.reverseProxy(c, buf)
+		return
 	}
 
-	ctx, cancel := context.WithTimeout(s.ctx, DefaultTimeout)
+	target := string(parts[3])
+	ctx, cancel := context.WithTimeout(s.ctx, Timeout)
 	defer cancel()
-
-	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	tc, err := (&net.Dialer{}).DialContext(ctx, "tcp", target)
 	if err != nil {
-		return nil, fmt.Errorf("dial: %w", err)
+		return
 	}
+	defer tc.Close()
 
-	tlsConn := tls.Client(conn, tlsConfig)
-
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("generate nonce: %w", err)
-	}
-
-	if err := s.sendAuth(tlsConn, target, nonce); err != nil {
-		tlsConn.Close()
-		return nil, fmt. Errorf("auth: %w", err)
-	}
-
-	return tlsConn, nil
+	log.Printf("eq %s -> %s", c.RemoteAddr(), target)
+	relay(s.ctx, c, tc, s.cfg.In.Frame, time.Duration(s.cfg.In.Clock)*time.Millisecond)
 }
 
-// sendAuth sends authentication frame to server
-func (s *Server) sendAuth(conn net.Conn, target string, nonce []byte) error {
-	conn.SetWriteDeadline(time.Now().Add(DefaultTimeout))
-	defer conn.SetWriteDeadline(time.Time{})
-
-	frame, err := BuildAuthFrame(s.config.Out.SID, target, nonce, s.config.Out.Frame)
+func (s *Server) reverseProxy(c net.Conn, initial []byte) {
+	if s.cfg.In.Reverse == nil {
+		return
+	}
+	target := fmt.Sprintf("%s:%d", s.cfg.In.Reverse.Host, s.cfg.In.Reverse.Port)
+	tc, err := net.DialTimeout("tcp", target, Timeout)
 	if err != nil {
-		return fmt.Errorf("build auth frame: %w", err)
+		return
+	}
+	defer tc.Close()
+
+	if len(initial) > 0 {
+		tc.Write(initial)
 	}
 
-	buf, err := frame.Marshal(s.config.Out.Frame)
-	if err != nil {
-		return fmt.Errorf("marshal auth frame: %w", err)
-	}
-
-	_, err = conn.Write(buf)
-	return err
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(tc, c); done <- struct{}{} }()
+	go func() { io.Copy(c, tc); done <- struct{}{} }()
+	<-done
 }
 
-// RunServer runs the EQ server mode
-func (s *Server) RunServer() error {
-	ln, err := s.createListener()
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
-	}
-	defer ln.Close()
+func relay(ctx context.Context, proto, plain net.Conn, frameSize int, clock time.Duration) {
+	done := make(chan struct{})
+	go recvFrames(ctx, proto, plain, frameSize, done)
+	go sendFrames(ctx, proto, plain, frameSize, clock, done)
+	<-done
+}
 
-	addr := fmt.Sprintf(":%d", s.config.In.Port)
-	log.Printf("Server listening on %s (frame=%d, clock=%dms)", addr, s.config.In.Frame, s.config.In.Clock)
-	if s.config.In.SSL != nil {
-		log.Printf("TLS enabled")
-	}
-
+func recvFrames(ctx context.Context, proto, plain net.Conn, frameSize int, done chan struct{}) {
+	defer func() { close(done) }()
+	buf := make([]byte, frameSize)
 	for {
 		select {
-		case <-s. ctx.Done():
-			return nil
+		case <-ctx.Done():
+			return
 		default:
 		}
 
-		if tcpLn, ok := ln. (*net.TCPListener); ok {
-			tcpLn. SetDeadline(time.Now().Add(time.Second))
-		}
+		proto.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := io.ReadFull(proto, buf)
+		proto.SetReadDeadline(time.Time{})
 
-		conn, err := ln.Accept()
 		if err != nil {
-			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
-				continue
-			}
-			select {
-			case <-s.ctx.Done():
-				return nil
-			default:
-				log.Printf("Accept error: %v", err)
-				continue
-			}
+			return
+		}
+		if n != frameSize {
+			return
 		}
 
-		s.activeConns.Add(1)
-		go func() {
-			defer s.activeConns.Done()
-			if err := s.handleClient(conn); err != nil {
-				if s.verbose {
-					log.Printf("Client error: %v", err)
+		frame := &Frame{}
+		if frame.unmarshal(buf) != nil {
+			return
+		}
+
+		switch frame.Type {
+		case TypeData:
+			if len(frame.Data) > 0 {
+				plain.Write(frame.Data)
+			}
+		case TypeClose:
+			return
+		}
+	}
+}
+
+func sendFrames(ctx context.Context, proto, plain net.Conn, frameSize int, clock time.Duration, done chan struct{}) {
+	ticker := time.NewTicker(clock)
+	defer ticker.Stop()
+
+	readBuf := make([]byte, 65535)
+	pending := make([]byte, 0, MaxPend)
+	dataSize := frameSize - 3
+	closed := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			sendClose(proto, frameSize)
+			return
+		case <-done:
+			sendClose(proto, frameSize)
+			return
+		case <-ticker.C:
+			if !closed && len(pending) < MaxPend {
+				plain.SetReadDeadline(time.Now().Add(time.Millisecond))
+				n, err := plain.Read(readBuf)
+				plain.SetReadDeadline(time.Time{})
+				if n > 0 {
+					pending = append(pending, readBuf[:n]...)
+				}
+				if err == io.EOF || (err != nil && !isTimeout(err)) {
+					closed = true
 				}
 			}
-		}()
+
+			if closed && len(pending) == 0 {
+				sendClose(proto, frameSize)
+				return
+			}
+
+			var frame *Frame
+			if len(pending) > 0 {
+				size := len(pending)
+				if size > dataSize {
+					size = dataSize
+				}
+				frame = &Frame{Type: TypeData, Length: uint16(size), Data: pending[:size]}
+				pending = pending[size:]
+			} else {
+				frame = &Frame{Type: TypePad, Length: 0}
+			}
+
+			frameBuf, _ := frame.marshal(frameSize)
+			proto.Write(frameBuf)
+		}
 	}
 }
 
-// createListener creates appropriate listener (TLS or plain)
-func (s *Server) createListener() (net.Listener, error) {
-	addr := fmt.Sprintf(":%d", s.config.In.Port)
-
-	if s.config.In. SSL != nil {
-		cert, err := tls.LoadX509KeyPair(s.config.In.SSL.Crt, s.config.In. SSL.Key)
-		if err != nil {
-			return nil, fmt.Errorf("load certificates: %w", err)
-		}
-
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
-
-		return tls.Listen("tcp", addr, tlsConfig)
-	}
-
-	return net.Listen("tcp", addr)
+func sendClose(c net.Conn, frameSize int) {
+	frame := &Frame{Type: TypeClose, Length: 0}
+	buf, _ := frame.marshal(frameSize)
+	c.Write(buf)
 }
 
-// handleClient processes an EQ client connection
-func (s *Server) handleClient(eqConn net.Conn) error {
-	defer eqConn.Close()
-
-	// Read auth frame with timeout
-	buf := make([]byte, s.config.In.Frame)
-	eqConn.SetReadDeadline(time.Now(). Add(DefaultTimeout))
-	n, err := io.ReadFull(eqConn, buf)
-	eqConn.SetReadDeadline(time.Time{})
-
-	if err != nil {
-		return fmt.Errorf("read auth frame: %w", err)
+func (f *Frame) marshal(frameSize int) ([]byte, error) {
+	buf := make([]byte, frameSize)
+	buf[0] = f.Type
+	binary.BigEndian.PutUint16(buf[1:3], f.Length)
+	if f.Length > 0 {
+		copy(buf[3:], f.Data[:f.Length])
 	}
-
-	if n != s.config.In.Frame {
-		return fmt.Errorf("incomplete auth frame: got %d, expected %d", n, s. config.In.Frame)
+	if int(f.Length) < frameSize-3 {
+		rand.Read(buf[3+f.Length:])
 	}
+	return buf, nil
+}
 
-	frame := &Frame{}
-	if err := frame. Unmarshal(buf); err != nil {
-		return fmt.Errorf("unmarshal auth frame: %w", err)
+func (f *Frame) unmarshal(buf []byte) error {
+	if len(buf) < 3 {
+		return fmt.Errorf("short")
 	}
-
-	if frame.Type != TypeAuth {
-		return fmt. Errorf("expected auth frame, got type %d", frame.Type)
+	f.Type = buf[0]
+	f.Length = binary.BigEndian.Uint16(buf[1:3])
+	if f.Length > uint16(len(buf)-3) {
+		return fmt.Errorf("truncated")
 	}
-
-	auth, err := ParseAuthData(frame.Data)
-	if err != nil {
-		return fmt.Errorf("parse auth data: %w", err)
+	if f.Length > 0 {
+		f.Data = make([]byte, f.Length)
+		copy(f.Data, buf[3:3+f.Length])
 	}
-
-	if ! IsAuthTimestampValid(auth.Timestamp, 300) {
-		return fmt. Errorf("timestamp outside acceptable window")
-	}
-
-	valid, err := VerifyAuth(auth, s.config.In.SIDs. Items)
-	if err != nil || !valid {
-		return fmt. Errorf("authentication failed")
-	}
-
-	target := string(auth.Target)
-	if target == "" && s.config.In. Reverse != nil {
-		target = fmt.Sprintf("%s:%d", s.config.In. Reverse.Host, s.config.In. Reverse.Port)
-	}
-
-	if target == "" {
-		return fmt.Errorf("no target specified")
-	}
-
-	// Connect to target server
-	ctx, cancel := context.WithTimeout(s.ctx, DefaultTimeout)
-	defer cancel()
-
-	targetConn, err := (&net.Dialer{}). DialContext(ctx, "tcp", target)
-	if err != nil {
-		return fmt. Errorf("dial target %s: %w", target, err)
-	}
-	defer targetConn.Close()
-
-	log.Printf("Proxying: %s -> %s", eqConn.RemoteAddr(), target)
-
-	cfg := RelayConfig{
-		Clock:     time. Duration(s.config.In.Clock) * time.Millisecond,
-		FrameSize: s.config.In. Frame,
-		Verbose:   s.verbose,
-	}
-
-	if err := ServerRelay(s.ctx, eqConn, targetConn, cfg); err != nil {
-		if s.verbose {
-			log.Printf("Relay error: %v", err)
-		}
-	}
-
-	log.Printf("Closed: %s -> %s", eqConn.RemoteAddr(), target)
 	return nil
+}
+
+func split(data []byte, sep byte) [][]byte {
+	parts := make([][]byte, 0, 4)
+	start := 0
+	for i := 0; i < len(data); i++ {
+		if data[i] == sep {
+			parts = append(parts, data[start:i])
+			start = i + 1
+		}
+	}
+	parts = append(parts, data[start:])
+	return parts
+}
+
+func isTimeout(err error) bool {
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Timeout()
+	}
+	return false
 }
