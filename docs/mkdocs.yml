@@ -1,0 +1,7 @@
+site_name: Equality
+theme:
+  name: cinder
+plugins:
+- autorefs
+not_in_nav:
+  index.md
