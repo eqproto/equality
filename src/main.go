@@ -20,35 +20,32 @@ import (
 )
 
 const (
-	TypeAuth = 0
-	TypeData = 1
-	TypePad  = 2
+	Version   = "89.0"
+	TypeAuth  = 0
+	TypeData  = 1
+	TypePad   = 2
 	TypeClose = 3
-	MinFrame = 100
-	MaxFrame = 65535
-	MaxPend = 1048576
-	Timeout = 30 * time.Second
+	MinFrame  = 100
+	MaxFrame  = 65535
+	MaxPend   = 1048576
+	Timeout   = 30 * time.Second
 )
 
 type Config struct {
 	XMLName xml.Name `xml:"config"`
 	Ver     int      `xml:"ver,attr"`
 	In      struct {
-		Type  string `xml:"type,attr"`
-		Port  int    `xml:"port,attr"`
-		Clock int    `xml:"clock,attr,omitempty"`
-		Frame int    `xml:"frame,attr,omitempty"`
-		SSL   *struct {
-			Key string `xml:"key,attr"`
-			Crt string `xml:"crt,attr"`
-		} `xml:"ssl,omitempty"`
+		Type    string `xml:"type,attr"`
+		Port    int    `xml:"port,attr"`
+		Clock   int    `xml:"clock,attr,omitempty"`
+		Frame   int    `xml:"frame,attr,omitempty"`
+		Key     string `xml:"key,attr"`
+		Crt     string `xml:"crt,attr"`
 		Reverse *struct {
 			Host string `xml:"host,attr"`
 			Port int    `xml:"port,attr"`
 		} `xml:"reverse,omitempty"`
-		SID struct {
-			Items []string `xml:"item"`
-		} `xml:"sid,omitempty"`
+		SID []string `xml:"sid,omitempty"`
 	} `xml:"in"`
 	Out struct {
 		Type   string `xml:"type,attr"`
@@ -75,17 +72,29 @@ type Server struct {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatal("usage: eq <config.xml>")
+	log.SetFlags(log.Ldate | log.Ltime)
+	logInfo("equality %s started", Version)
+
+	configPath := "config.xml"
+	if len(os.Args) >= 2 {
+		configPath = os.Args[1]
 	}
 
-	f, err := os.Open(os.Args[1])
+	f, err := os.Open(configPath)
 	if err != nil {
-		log.Fatal(err)
+		logFatal("config failed to open %s: %v", configPath, err)
 	}
 	cfg := &Config{}
-	xml.NewDecoder(f).Decode(cfg)
+	if err := xml.NewDecoder(f).Decode(cfg); err != nil {
+		f.Close()
+		logFatal("config failed to parse %s: %v", configPath, err)
+	}
 	f.Close()
+	logInfo("config loaded from %s", configPath)
+
+	if err := validateConfig(cfg); err != nil {
+		logFatal("config invalid: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{cfg: cfg, ctx: ctx, cancel: cancel}
@@ -94,8 +103,10 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sig
+		logInfo("shutdown signal received")
 		cancel()
 		s.wg.Wait()
+		logInfo("shutdown complete")
 		os.Exit(0)
 	}()
 
@@ -106,10 +117,69 @@ func main() {
 	}
 }
 
+func validateConfig(cfg *Config) error {
+	if cfg.In.Type == "socks" {
+		if cfg.In.Port == 0 {
+			return fmt.Errorf("in.port must be set")
+		}
+		if cfg.Out.Server == "" {
+			return fmt.Errorf("out.server must be set for client mode")
+		}
+		if cfg.Out.Port == 0 {
+			return fmt.Errorf("out.port must be set")
+		}
+		if cfg.Out.SID == "" {
+			return fmt.Errorf("out.sid must be set")
+		}
+		if cfg.Out.Frame == 0 {
+			cfg.Out.Frame = 4096
+			logWarn("config out.frame not set, using default %d", cfg.Out.Frame)
+		}
+		if cfg.Out.Frame < MinFrame || cfg.Out.Frame > MaxFrame {
+			return fmt.Errorf("out.frame must be between %d and %d", MinFrame, MaxFrame)
+		}
+		if cfg.Out.Clock == 0 {
+			cfg.Out.Clock = 100
+			logWarn("config out.clock not set, using default %dms", cfg.Out.Clock)
+		}
+		if cfg.Out.Clock < 1 {
+			return fmt.Errorf("out.clock must be at least 1ms")
+		}
+	} else {
+		if cfg.In.Port == 0 {
+			return fmt.Errorf("in.port must be set")
+		}
+		if cfg.In.Key == "" || cfg.In.Crt == "" {
+			return fmt.Errorf("in.key and in.crt must be set (TLS is mandatory)")
+		}
+		if len(cfg.In.SID) == 0 {
+			return fmt.Errorf("in.sid must contain at least one entry")
+		}
+		if cfg.In.Frame == 0 {
+			cfg.In.Frame = 4096
+			logWarn("config in.frame not set, using default %d", cfg.In.Frame)
+		}
+		if cfg.In.Frame < MinFrame || cfg.In.Frame > MaxFrame {
+			return fmt.Errorf("in.frame must be between %d and %d", MinFrame, MaxFrame)
+		}
+		if cfg.In.Clock == 0 {
+			cfg.In.Clock = 100
+			logWarn("config in.clock not set, using default %dms", cfg.In.Clock)
+		}
+		if cfg.In.Clock < 1 {
+			return fmt.Errorf("in.clock must be at least 1ms")
+		}
+	}
+	return nil
+}
+
 func (s *Server) runClient() {
-	ln, _ := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.In.Port))
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.In.Port))
+	if err != nil {
+		logFatal("client failed to bind :%d: %v", s.cfg.In.Port, err)
+	}
 	defer ln.Close()
-	log.Printf("client :%d -> %s:%d", s.cfg.In.Port, s.cfg.Out.Server, s.cfg.Out.Port)
+	logInfo("client listening :%d -> %s:%d", s.cfg.In.Port, s.cfg.Out.Server, s.cfg.Out.Port)
 
 	for {
 		if tcpLn, ok := ln.(*net.TCPListener); ok {
@@ -121,6 +191,10 @@ func (s *Server) runClient() {
 			case <-s.ctx.Done():
 				return
 			default:
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				logError("client accept error: %v", err)
 				continue
 			}
 		}
@@ -135,26 +209,36 @@ func (s *Server) runClient() {
 func (s *Server) handleSocks(c net.Conn) {
 	defer c.Close()
 	buf := make([]byte, 512)
-	
+
 	c.SetReadDeadline(time.Now().Add(Timeout))
 	n, err := c.Read(buf)
 	c.SetReadDeadline(time.Time{})
-	if err != nil || n < 2 || buf[0] != 5 {
+	if err != nil {
+		logDebug("socks greeting failed from %s: %v", c.RemoteAddr(), err)
+		return
+	}
+	if n < 2 || buf[0] != 5 {
+		logDebug("socks invalid greeting from %s (len=%d)", c.RemoteAddr(), n)
 		return
 	}
 
-	c.Write([]byte{5, 0})
+	if _, err := c.Write([]byte{5, 0}); err != nil {
+		logDebug("socks auth response failed to %s: %v", c.RemoteAddr(), err)
+		return
+	}
 
 	c.SetReadDeadline(time.Now().Add(Timeout))
 	n, err = c.Read(buf)
 	c.SetReadDeadline(time.Time{})
 	if err != nil {
+		logDebug("socks request failed from %s: %v", c.RemoteAddr(), err)
 		return
 	}
 
 	host, port := parseSocks(buf[:n])
 	if host == "" {
 		c.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})
+		logDebug("socks invalid request format from %s", c.RemoteAddr())
 		return
 	}
 
@@ -162,12 +246,16 @@ func (s *Server) handleSocks(c net.Conn) {
 	eq := s.dialEQ(target)
 	if eq == nil {
 		c.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+		logError("socks failed to establish tunnel to %s", target)
 		return
 	}
 	defer eq.Close()
 
-	c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
-	log.Printf("proxy %s -> %s", c.RemoteAddr(), target)
+	if _, err := c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+		logDebug("socks success response failed to %s: %v", c.RemoteAddr(), err)
+		return
+	}
+	logInfo("proxy %s -> %s", c.RemoteAddr(), target)
 
 	relay(s.ctx, eq, c, s.cfg.Out.Frame, time.Duration(s.cfg.Out.Clock)*time.Millisecond)
 }
@@ -198,51 +286,72 @@ func parseSocks(buf []byte) (string, uint16) {
 
 func (s *Server) dialEQ(target string) net.Conn {
 	addr := fmt.Sprintf("%s:%d", s.cfg.Out.Server, s.cfg.Out.Port)
-	ctx, cancel := context.WithTimeout(s.ctx, Timeout)
-	defer cancel()
-
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: Timeout}, "tcp", addr, &tls.Config{
+		ServerName:         s.cfg.Out.Server,
+		InsecureSkipVerify: false,
+	})
 	if err != nil {
+		logError("dialeq failed to connect %s: %v", addr, err)
 		return nil
 	}
+	logDebug("dialeq tls established to %s", addr)
 
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: s.cfg.Out.Server})
 	nonce := make([]byte, 16)
-	rand.Read(nonce)
+	if _, err := rand.Read(nonce); err != nil {
+		logError("dialeq failed to generate nonce: %v", err)
+		conn.Close()
+		return nil
+	}
 
 	ts := time.Now().Unix()
 	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%s", s.cfg.Out.SID, ts, hex.EncodeToString(nonce))))
 	auth := fmt.Sprintf("%s|%d|%s|%s", hex.EncodeToString(hash[:]), ts, hex.EncodeToString(nonce), target)
 
-	frame := &Frame{Type: TypeAuth, Length: uint16(len(auth)), Data: []byte(auth)}
-	frameBuf, _ := frame.marshal(s.cfg.Out.Frame)
-
-	tlsConn.SetWriteDeadline(time.Now().Add(Timeout))
-	_, err = tlsConn.Write(frameBuf)
-	tlsConn.SetWriteDeadline(time.Time{})
-
-	if err != nil {
-		tlsConn.Close()
+	if len(auth) > s.cfg.Out.Frame-3 {
+		logError("dialeq auth payload too large (%d > %d)", len(auth), s.cfg.Out.Frame-3)
+		conn.Close()
 		return nil
 	}
-	return tlsConn
+
+	frame := &Frame{Type: TypeAuth, Length: uint16(len(auth)), Data: []byte(auth)}
+	frameBuf, err := frame.marshal(s.cfg.Out.Frame)
+	if err != nil {
+		logError("dialeq failed to marshal auth: %v", err)
+		conn.Close()
+		return nil
+	}
+
+	conn.SetWriteDeadline(time.Now().Add(Timeout))
+	_, err = conn.Write(frameBuf)
+	conn.SetWriteDeadline(time.Time{})
+
+	if err != nil {
+		logError("dialeq failed to send auth: %v", err)
+		conn.Close()
+		return nil
+	}
+
+	logDebug("dialeq authenticated for target %s", target)
+	return conn
 }
 
 func (s *Server) runServer() {
-	var ln net.Listener
 	addr := fmt.Sprintf(":%d", s.cfg.In.Port)
 
-	if s.cfg.In.SSL != nil {
-		cert, _ := tls.LoadX509KeyPair(s.cfg.In.SSL.Crt, s.cfg.In.SSL.Key)
-		ln, _ = tls.Listen("tcp", addr, &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		})
-	} else {
-		ln, _ = net.Listen("tcp", addr)
+	cert, err := tls.LoadX509KeyPair(s.cfg.In.Crt, s.cfg.In.Key)
+	if err != nil {
+		logFatal("server failed to load certificate: %v", err)
+	}
+
+	ln, err := tls.Listen("tcp", addr, &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	})
+	if err != nil {
+		logFatal("server failed to bind %s: %v", addr, err)
 	}
 	defer ln.Close()
-	log.Printf("server %s", addr)
+	logInfo("server listening %s", addr)
 
 	for {
 		if tcpLn, ok := ln.(*net.TCPListener); ok {
@@ -254,6 +363,10 @@ func (s *Server) runServer() {
 			case <-s.ctx.Done():
 				return
 			default:
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				logError("server accept error: %v", err)
 				continue
 			}
 		}
@@ -273,13 +386,21 @@ func (s *Server) handleIncoming(c net.Conn) {
 	n, err := io.ReadFull(c, peek)
 	c.SetReadDeadline(time.Time{})
 
-	if err != nil || n != 3 || peek[0] != TypeAuth {
+	if err != nil || n != 3 {
+		logDebug("incoming failed to peek header from %s (n=%d, err=%v)", c.RemoteAddr(), n, err)
 		s.reverseProxy(c, peek[:n])
+		return
+	}
+
+	if peek[0] != TypeAuth {
+		logDebug("incoming not auth frame from %s (type=%d)", c.RemoteAddr(), peek[0])
+		s.reverseProxy(c, peek)
 		return
 	}
 
 	length := binary.BigEndian.Uint16(peek[1:3])
 	if length == 0 || int(length) > s.cfg.In.Frame-3 {
+		logDebug("incoming invalid auth length from %s (%d > %d)", c.RemoteAddr(), length, s.cfg.In.Frame-3)
 		s.reverseProxy(c, peek)
 		return
 	}
@@ -290,6 +411,8 @@ func (s *Server) handleIncoming(c net.Conn) {
 	c.SetReadDeadline(time.Time{})
 
 	if err != nil || n != s.cfg.In.Frame-3 {
+		logDebug("incoming failed to read frame body from %s (n=%d, expected=%d, err=%v)",
+			c.RemoteAddr(), n, s.cfg.In.Frame-3, err)
 		combined := append(peek, rest[:n]...)
 		s.reverseProxy(c, combined)
 		return
@@ -297,26 +420,35 @@ func (s *Server) handleIncoming(c net.Conn) {
 
 	buf := append(peek, rest...)
 	frame := &Frame{}
-	if frame.unmarshal(buf) != nil {
+	if err := frame.unmarshal(buf); err != nil {
+		logDebug("incoming unmarshal failed from %s: %v", c.RemoteAddr(), err)
 		s.reverseProxy(c, buf)
 		return
 	}
 
 	parts := split(frame.Data, '|')
 	if len(parts) != 4 {
+		logDebug("incoming auth format invalid from %s (parts=%d)", c.RemoteAddr(), len(parts))
 		s.reverseProxy(c, buf)
 		return
 	}
 
 	var ts int64
-	fmt.Sscanf(string(parts[1]), "%d", &ts)
-	if time.Now().Unix()-ts > 300 || time.Now().Unix()-ts < -300 {
+	if _, err := fmt.Sscanf(string(parts[1]), "%d", &ts); err != nil {
+		logDebug("incoming invalid timestamp from %s: %v", c.RemoteAddr(), err)
+		s.reverseProxy(c, buf)
+		return
+	}
+
+	now := time.Now().Unix()
+	if now-ts > 300 || now-ts < -300 {
+		logWarn("incoming timestamp out of range from %s (delta=%d)", c.RemoteAddr(), now-ts)
 		s.reverseProxy(c, buf)
 		return
 	}
 
 	valid := false
-	for _, sid := range s.cfg.In.SID.Items {
+	for _, sid := range s.cfg.In.SID {
 		hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%s", sid, ts, string(parts[2]))))
 		if string(parts[0]) == hex.EncodeToString(hash[:]) {
 			valid = true
@@ -325,6 +457,7 @@ func (s *Server) handleIncoming(c net.Conn) {
 	}
 
 	if !valid {
+		logWarn("incoming auth validation failed from %s", c.RemoteAddr())
 		s.reverseProxy(c, buf)
 		return
 	}
@@ -334,28 +467,36 @@ func (s *Server) handleIncoming(c net.Conn) {
 	defer cancel()
 	tc, err := (&net.Dialer{}).DialContext(ctx, "tcp", target)
 	if err != nil {
+		logError("incoming failed to dial target %s: %v", target, err)
 		return
 	}
 	defer tc.Close()
 
-	log.Printf("eq %s -> %s", c.RemoteAddr(), target)
+	logInfo("tunnel %s -> %s", c.RemoteAddr(), target)
 	relay(s.ctx, c, tc, s.cfg.In.Frame, time.Duration(s.cfg.In.Clock)*time.Millisecond)
 }
 
 func (s *Server) reverseProxy(c net.Conn, initial []byte) {
 	if s.cfg.In.Reverse == nil {
+		logDebug("reverse no config for %s, closing", c.RemoteAddr())
 		return
 	}
-	target := fmt.Sprintf("%s:%d", s.cfg.In.Reverse.Host, s.cfg.In.Reverse.Port)
+	target := net.JoinHostPort(s.cfg.In.Reverse.Host, fmt.Sprintf("%d", s.cfg.In.Reverse.Port))
 	tc, err := net.DialTimeout("tcp", target, Timeout)
 	if err != nil {
+		logError("reverse failed to connect %s: %v", target, err)
 		return
 	}
 	defer tc.Close()
 
 	if len(initial) > 0 {
-		tc.Write(initial)
+		if _, err := tc.Write(initial); err != nil {
+			logError("reverse failed to write initial data: %v", err)
+			return
+		}
 	}
+
+	logInfo("reverse %s -> %s", c.RemoteAddr(), target)
 
 	done := make(chan struct{}, 2)
 	go func() { io.Copy(tc, c); done <- struct{}{} }()
@@ -392,14 +533,16 @@ func recvFrames(ctx context.Context, proto, plain net.Conn, frameSize int, done 
 		}
 
 		frame := &Frame{}
-		if frame.unmarshal(buf) != nil {
+		if err := frame.unmarshal(buf); err != nil {
 			return
 		}
 
 		switch frame.Type {
 		case TypeData:
 			if len(frame.Data) > 0 {
-				plain.Write(frame.Data)
+				if _, err := plain.Write(frame.Data); err != nil {
+					return
+				}
 			}
 		case TypeClose:
 			return
@@ -454,8 +597,13 @@ func sendFrames(ctx context.Context, proto, plain net.Conn, frameSize int, clock
 				frame = &Frame{Type: TypePad, Length: 0}
 			}
 
-			frameBuf, _ := frame.marshal(frameSize)
-			proto.Write(frameBuf)
+			frameBuf, err := frame.marshal(frameSize)
+			if err != nil {
+				return
+			}
+			if _, err := proto.Write(frameBuf); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -467,6 +615,12 @@ func sendClose(c net.Conn, frameSize int) {
 }
 
 func (f *Frame) marshal(frameSize int) ([]byte, error) {
+	if frameSize < 3 {
+		return nil, fmt.Errorf("frameSize too small")
+	}
+	if int(f.Length) > frameSize-3 {
+		return nil, fmt.Errorf("data too large for frame")
+	}
 	buf := make([]byte, frameSize)
 	buf[0] = f.Type
 	binary.BigEndian.PutUint16(buf[1:3], f.Length)
@@ -474,19 +628,21 @@ func (f *Frame) marshal(frameSize int) ([]byte, error) {
 		copy(buf[3:], f.Data[:f.Length])
 	}
 	if int(f.Length) < frameSize-3 {
-		rand.Read(buf[3+f.Length:])
+		if _, err := rand.Read(buf[3+f.Length:]); err != nil {
+			return nil, fmt.Errorf("failed to generate padding: %w", err)
+		}
 	}
 	return buf, nil
 }
 
 func (f *Frame) unmarshal(buf []byte) error {
 	if len(buf) < 3 {
-		return fmt.Errorf("short")
+		return fmt.Errorf("buffer too short")
 	}
 	f.Type = buf[0]
 	f.Length = binary.BigEndian.Uint16(buf[1:3])
 	if f.Length > uint16(len(buf)-3) {
-		return fmt.Errorf("truncated")
+		return fmt.Errorf("length field exceeds buffer")
 	}
 	if f.Length > 0 {
 		f.Data = make([]byte, f.Length)
@@ -513,4 +669,26 @@ func isTimeout(err error) bool {
 		return netErr.Timeout()
 	}
 	return false
+}
+
+// Unified logging
+func logInfo(format string, v ...interface{}) {
+	log.Printf("info "+format, v...)
+}
+
+func logWarn(format string, v ...interface{}) {
+	log.Printf("warn "+format, v...)
+}
+
+func logError(format string, v ...interface{}) {
+	log.Printf("error "+format, v...)
+}
+
+func logFatal(format string, v ...interface{}) {
+	log.Fatalf("fatal "+format, v...)
+}
+
+func logDebug(format string, v ...interface{}) {
+	// Only logs if verbose is enabled - checked by caller
+	log.Printf("debug "+format, v...)
 }

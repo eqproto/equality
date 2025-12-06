@@ -41,10 +41,9 @@
 #### `type="eq"` — EQ сервер
 
 ```xml
-<in type="eq" port="443" clock="20" frame="700">
-    <sid>
-        <item>secret-key-min-16-chars-abc123</item>
-    </sid>
+<in type="eq" port="443" clock="20" frame="700"
+     key="/path/to/private.key" crt="/path/to/certificate.crt" >
+    <sid>secret-key-min-16-chars-abc123</sid>
 </in>
 ```
 
@@ -57,24 +56,13 @@
 ##### `<sid>` — Ключи аутентификации
 
 ```xml
-<sid>
-    <item>key-1-production-v1</item>
-    <item>key-2-production-v2</item>
-</sid>
+<sid>key-1-production-v1</sid>
+<sid>key-2-production-v2</sid>
 ```
 
 - Минимум 16 символов
 - Можно несколько для ротации
 - Генерация: `openssl rand -hex 32`
-
-##### `<ssl>` — TLS (опционально)
-
-```xml
-<ssl
- key="/path/to/private.key"
- crt="/path/to/certificate.crt"
-/>
-```
 
 ##### `<reverse>` — Обратный прокси (опционально)
 
@@ -182,9 +170,7 @@ max_throughput ≈ (frame - 3) × (1000 / clock) байт/сек
 ```xml
 <config ver="1">
     <in type="eq" port="443" clock="20" frame="700">
-        <sid>
-            <item>production-key-2024-abc123</item>
-        </sid>
+        <sid>production-key-2024-abc123</sid>
         <ssl
          key="/etc/letsencrypt/live/example.com/privkey.pem"
          crt="/etc/letsencrypt/live/example.com/fullchain.pem"
@@ -201,9 +187,7 @@ Target берётся из AUTH фрейма клиента.
 ```xml
 <config ver="1">
     <in type="eq" port="443" clock="20" frame="700">
-        <sid>
-            <item>webserver-key-2024</item>
-        </sid>
+        <sid>webserver-key-2024</sid>
         <ssl
          key="/etc/ssl/private/server.key"
          crt="/etc/ssl/certs/server.crt"
@@ -222,12 +206,10 @@ Target берётся из AUTH фрейма клиента.
 
 #### Ротация ключей
 
-1. Добавить новый SID:
+1. Добавить новые ключи (повторяющиеся `<sid>` элементы):
 ```xml
-<sid>
-    <item>old-key</item>
-    <item>new-key-2024</item>
-</sid>
+<sid>old-key</sid>
+<sid>new-key-2024</sid>
 ```
 
 2. Перезапустить сервер
